@@ -3,7 +3,7 @@ type: awsattributelimit
 status:
   class: processor
   stability:
-    beta: [metrics]
+    beta: [metrics, profiles]
   distributions: []
   codeowners:
     active: [sky333999, movence]

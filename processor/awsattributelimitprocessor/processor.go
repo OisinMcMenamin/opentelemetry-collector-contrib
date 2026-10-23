@@ -98,10 +98,10 @@ var attrEntryPool = sync.Pool{
 	},
 }
 
-// removeExcessByTier collects droppable attributes from datapoint, scope, and resource,
+// removeExcessByTier collects droppable attributes from the leaf dimension, scope, and resource,
 // sorts by tier then alphabetically, and removes them until the excess count is satisfied.
 // Returns the number of attributes dropped and the min/max tier used.
-func removeExcessByTier(resourceAttrs, scopeAttrs, datapointAttrs pcommon.Map, excess int) (droppedCount, minTier, maxTier int) {
+func removeExcessByTier(resourceAttrs, scopeAttrs pcommon.Map, leaf leafAttributes, excess int) (droppedCount, minTier, maxTier int) {
 	droppablePtr := attrEntryPool.Get().(*[]attrEntry)
 	droppable := (*droppablePtr)[:0]
 	defer func() {
@@ -127,8 +127,8 @@ func removeExcessByTier(resourceAttrs, scopeAttrs, datapointAttrs pcommon.Map, e
 		return true
 	})
 
-	// Scan datapoint attributes (tier 10).
-	datapointAttrs.Range(func(key string, _ pcommon.Value) bool {
+	// Scan leaf attributes -- metric datapoint attributes or profile attributes (tier 10).
+	leaf.rangeKeys(func(key string) bool {
 		tier := classifyAttribute(key, attrSourceDatapoint)
 		if tier > 0 {
 			droppable = append(droppable, attrEntry{key: key, tier: tier, source: attrSourceDatapoint})
@@ -153,7 +153,7 @@ func removeExcessByTier(resourceAttrs, scopeAttrs, datapointAttrs pcommon.Map, e
 		}
 		switch entry.source {
 		case attrSourceDatapoint:
-			datapointAttrs.Remove(entry.key)
+			leaf.remove(entry.key)
 		case attrSourceScope:
 			scopeAttrs.Remove(entry.key)
 		case attrSourceResource:
@@ -170,13 +170,13 @@ func removeExcessByTier(resourceAttrs, scopeAttrs, datapointAttrs pcommon.Map, e
 }
 
 // logDropWarning emits a rate-limited warning when tier-based dropping occurs.
-// Logs at most once per metric name per minute.
-func (p *attributeLimitProcessor) logDropWarning(metricName string, droppedCount, minTier, maxTier int) {
-	if !p.shouldLog(metricName) {
+// Logs at most once per subject (metric name or profile sample type) per minute.
+func (p *attributeLimitProcessor) logDropWarning(subject string, droppedCount, minTier, maxTier int) {
+	if !p.shouldLog(subject) {
 		return
 	}
 	p.logger.Warn("dropped attributes to meet limit",
-		zap.String("metric", metricName),
+		zap.String("subject", subject),
 		zap.Int("dropped", droppedCount),
 		zap.Int("minTier", minTier),
 		zap.Int("maxTier", maxTier),
@@ -186,13 +186,13 @@ func (p *attributeLimitProcessor) logDropWarning(metricName string, droppedCount
 
 // logExhaustedError logs a rate-limited error when all tiers are exhausted
 // and force-pruning was required to meet the limit.
-func (p *attributeLimitProcessor) logExhaustedError(metricName string, remaining, forcePruned int) {
-	errorKey := metricName + ":exhausted"
+func (p *attributeLimitProcessor) logExhaustedError(subject string, remaining, forcePruned int) {
+	errorKey := subject + ":exhausted"
 	if !p.shouldLog(errorKey) {
 		return
 	}
 	p.logger.Error("all tiers exhausted, force-pruned protected attributes to meet limit",
-		zap.String("metric", metricName),
+		zap.String("subject", subject),
 		zap.Int("attributesBeforePrune", remaining),
 		zap.Int("forcePruned", forcePruned),
 		zap.Int("limit", p.config.MaxTotalAttributes),
@@ -222,26 +222,27 @@ func (p *attributeLimitProcessor) shouldLog(key string) bool {
 }
 
 // enforceLimit checks if the total attribute count exceeds the limit and runs
-// Phase 2 tier-based dropping if needed.
-func (p *attributeLimitProcessor) enforceLimit(resourceAttrs, scopeAttrs, datapointAttrs pcommon.Map, metricName string) {
-	total := resourceAttrs.Len() + scopeAttrs.Len() + datapointAttrs.Len()
+// Phase 2 tier-based dropping if needed. The leaf is the innermost per-record
+// attribute dimension: metric datapoint attributes or a profile's attributes.
+func (p *attributeLimitProcessor) enforceLimit(resourceAttrs, scopeAttrs pcommon.Map, leaf leafAttributes, subject string) {
+	total := resourceAttrs.Len() + scopeAttrs.Len() + leaf.Len()
 	if total <= p.config.MaxTotalAttributes {
 		return
 	}
 
 	excess := total - p.config.MaxTotalAttributes
-	droppedCount, minTier, maxTier := removeExcessByTier(resourceAttrs, scopeAttrs, datapointAttrs, excess)
+	droppedCount, minTier, maxTier := removeExcessByTier(resourceAttrs, scopeAttrs, leaf, excess)
 
 	if droppedCount > 0 {
-		p.logDropWarning(metricName, droppedCount, minTier, maxTier)
+		p.logDropWarning(subject, droppedCount, minTier, maxTier)
 	}
 
 	// If still over limit after tier-based dropping, force-prune remaining
 	// attributes (including protected ones) to guarantee we never exceed the limit.
-	remaining := resourceAttrs.Len() + scopeAttrs.Len() + datapointAttrs.Len()
+	remaining := resourceAttrs.Len() + scopeAttrs.Len() + leaf.Len()
 	if remaining > p.config.MaxTotalAttributes {
-		forcePruned := p.forcePrune(resourceAttrs, scopeAttrs, datapointAttrs)
-		p.logExhaustedError(metricName, remaining, forcePruned)
+		forcePruned := p.forcePrune(resourceAttrs, scopeAttrs, leaf)
+		p.logExhaustedError(subject, remaining, forcePruned)
 	}
 }
 
@@ -255,22 +256,22 @@ func (p *attributeLimitProcessor) enforceLimit(resourceAttrs, scopeAttrs, datapo
 // The drop order here is intentionally the opposite of tier-based dropping.
 // In tier-based dropping, resource labels are dropped first because they are
 // low-value metadata that customers rarely query by. But in forcePrune, every
-// remaining attribute is protected and important — so we minimize blast radius
-// by dropping datapoint attrs first (per-datapoint, no shared impact), then
-// scope, then resource last (shared across all datapoints in the batch).
+// remaining attribute is protected and important -- so we minimize blast radius
+// by dropping leaf attrs first (per-record, no shared impact), then
+// scope, then resource last (shared across all records under the resource).
 //
-// Within each map, keys are sorted alphabetically and removed from the end.
+// Within each dimension, keys are sorted alphabetically and removed from the end.
 // Returns the number of attributes force-pruned.
-func (p *attributeLimitProcessor) forcePrune(resourceAttrs, scopeAttrs, datapointAttrs pcommon.Map) int {
-	excess := resourceAttrs.Len() + scopeAttrs.Len() + datapointAttrs.Len() - p.config.MaxTotalAttributes
+func (p *attributeLimitProcessor) forcePrune(resourceAttrs, scopeAttrs pcommon.Map, leaf leafAttributes) int {
+	excess := resourceAttrs.Len() + scopeAttrs.Len() + leaf.Len() - p.config.MaxTotalAttributes
 	if excess <= 0 {
 		return 0
 	}
 
 	pruned := 0
 
-	// Prune datapoint attributes first (per-datapoint, least shared impact).
-	pruned += pruneFromMap(datapointAttrs, excess-pruned)
+	// Prune leaf attributes first (per-record, least shared impact).
+	pruned += pruneFromLeaf(leaf, excess-pruned)
 
 	// Then scope attributes.
 	if pruned < excess {
@@ -283,6 +284,29 @@ func (p *attributeLimitProcessor) forcePrune(resourceAttrs, scopeAttrs, datapoin
 	}
 
 	return pruned
+}
+
+// pruneFromLeaf removes up to `count` attributes from the leaf dimension, sorted
+// alphabetically (removes last keys first). Returns the number actually removed.
+func pruneFromLeaf(leaf leafAttributes, count int) int {
+	if count <= 0 || leaf.Len() == 0 {
+		return 0
+	}
+
+	keys := make([]string, 0, leaf.Len())
+	leaf.rangeKeys(func(key string) bool {
+		keys = append(keys, key)
+		return true
+	})
+	slices.Sort(keys)
+
+	// Remove from the end (alphabetically last). Each remove drops one occurrence.
+	removed := 0
+	for i := len(keys) - 1; i >= 0 && removed < count; i-- {
+		leaf.remove(keys[i])
+		removed++
+	}
+	return removed
 }
 
 // pruneFromMap removes up to `count` attributes from the map, sorted alphabetically
@@ -308,6 +332,31 @@ func pruneFromMap(attrs pcommon.Map, count int) int {
 	return removed
 }
 
+// leafAttributes abstracts the innermost per-record attribute dimension so the
+// tier-based limit algorithm is shared across signals: metric datapoint
+// attributes (a pcommon.Map) and profile attributes (dictionary-encoded indices,
+// see processor_profiles.go). Resource and scope attributes are always
+// pcommon.Map and are handled directly.
+type leafAttributes interface {
+	// Len reports the number of attributes in the dimension.
+	Len() int
+	// rangeKeys calls f for each attribute key; it stops early if f returns false.
+	rangeKeys(f func(key string) bool)
+	// remove deletes a single attribute occurrence with the given key.
+	remove(key string)
+}
+
+// mapLeaf adapts a pcommon.Map (metric datapoint attributes) to leafAttributes.
+type mapLeaf struct{ attrs pcommon.Map }
+
+func (l mapLeaf) Len() int { return l.attrs.Len() }
+
+func (l mapLeaf) rangeKeys(f func(string) bool) {
+	l.attrs.Range(func(k string, _ pcommon.Value) bool { return f(k) })
+}
+
+func (l mapLeaf) remove(key string) { l.attrs.Remove(key) }
+
 // processDatapoints is a generic helper that enforces the attribute limit on
 // all datapoints in a slice. It works with any datapoint type that exposes
 // Attributes() pcommon.Map.
@@ -323,7 +372,7 @@ func processDatapoints[DP interface{ Attributes() pcommon.Map }](
 ) {
 	for i := 0; i < datapoints.Len(); i++ {
 		dp := datapoints.At(i)
-		p.enforceLimit(resourceAttrs, scopeAttrs, dp.Attributes(), metricName)
+		p.enforceLimit(resourceAttrs, scopeAttrs, mapLeaf{dp.Attributes()}, metricName)
 	}
 }
 

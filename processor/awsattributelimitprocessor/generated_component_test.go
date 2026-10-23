@@ -15,9 +15,11 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pprofile"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/collector/processor/processortest"
+	"go.opentelemetry.io/collector/processor/xprocessor"
 )
 
 var typ = component.MustNewType("awsattributelimit")
@@ -42,6 +44,13 @@ func TestComponentLifecycle(t *testing.T) {
 			name: "metrics",
 			createFn: func(ctx context.Context, set processor.Settings, cfg component.Config) (component.Component, error) {
 				return factory.CreateMetrics(ctx, set, cfg, consumertest.NewNop())
+			},
+		},
+
+		{
+			name: "profiles",
+			createFn: func(ctx context.Context, set processor.Settings, cfg component.Config) (component.Component, error) {
+				return factory.(xprocessor.Factory).CreateProfiles(ctx, set, cfg, consumertest.NewNop())
 			},
 		},
 	}
@@ -92,6 +101,14 @@ func TestComponentLifecycle(t *testing.T) {
 						traces.MarkReadOnly()
 					}
 					err = e.ConsumeTraces(context.Background(), traces)
+				case "profiles":
+					e, ok := c.(xprocessor.Profiles)
+					require.True(t, ok)
+					profiles := generateLifecycleTestProfiles()
+					if !e.Capabilities().MutatesData {
+						profiles.MarkReadOnly()
+					}
+					err = e.ConsumeProfiles(context.Background(), profiles)
 				}
 			})
 			require.NoError(t, err)
@@ -134,6 +151,14 @@ func generateLifecycleTestTraces() ptrace.Traces {
 	span.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now().Add(-1 * time.Second)))
 	span.SetEndTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	return traces
+}
+
+func generateLifecycleTestProfiles() pprofile.Profiles {
+	profiles := pprofile.NewProfiles()
+	rp := profiles.ResourceProfiles().AppendEmpty()
+	rp.Resource().Attributes().PutStr("resource", "R1")
+	rp.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
+	return profiles
 }
 
 var _ component.Host = (*mdatagenNopHost)(nil)
