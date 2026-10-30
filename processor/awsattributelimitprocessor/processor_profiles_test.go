@@ -4,12 +4,18 @@
 package awsattributelimitprocessor
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/consumer/xconsumer"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/pprofile"
+	"go.opentelemetry.io/collector/processor/processortest"
+	"go.opentelemetry.io/collector/processor/xprocessor"
 	"go.uber.org/zap/zapcore"
 )
 
@@ -22,7 +28,21 @@ func newTestProfiles() (pd pprofile.Profiles, resource, scope pcommon.Map, dic p
 	rp := pd.ResourceProfiles().AppendEmpty()
 	sp := rp.ScopeProfiles().AppendEmpty()
 	prof = sp.Profiles().AppendEmpty()
-	return pd, rp.Resource().Attributes(), sp.Scope().Attributes(), pd.Dictionary(), prof
+	dic = pd.Dictionary()
+	seedProfileDict(dic)
+	return pd, rp.Resource().Attributes(), sp.Scope().Attributes(), dic, prof
+}
+
+// seedProfileDict installs the OTLP zero-value sentinel at index 0 of the string
+// and attribute tables, so real fixture attributes start at index 1 (index 0 is
+// reserved and not a real attribute).
+func seedProfileDict(dic pprofile.ProfilesDictionary) {
+	if dic.StringTable().Len() == 0 {
+		dic.StringTable().Append("")
+	}
+	if dic.AttributeTable().Len() == 0 {
+		dic.AttributeTable().AppendEmpty()
+	}
 }
 
 // addProfileAttr adds a profile-level attribute via the dictionary: it interns
@@ -92,7 +112,7 @@ func TestProfiles_TrimsToLimit(t *testing.T) {
 	resource.PutStr("telemetry.sdk.name", "otel")
 	// 160 droppable (tier 10) profile attrs -> total 165, limit 150, excess 15.
 	for i := range 160 {
-		addProfileAttr(dic, prof, "leaf.key"+pad(i))
+		addProfileAttr(dic, prof, "leaf.key"+fmt.Sprintf("%03d", i))
 	}
 	tableLenBefore := dic.AttributeTable().Len()
 
@@ -115,7 +135,7 @@ func TestProfiles_NeverDropsIdentity(t *testing.T) {
 	resource.PutStr("cloud.resource_id", "arn:...")
 	// 20 droppable profile attrs. Limit 5 forces all profile attrs to go.
 	for i := range 20 {
-		addProfileAttr(dic, prof, "leaf.key"+pad(i))
+		addProfileAttr(dic, prof, "leaf.key"+fmt.Sprintf("%03d", i))
 	}
 
 	p, _ := newTestProcessorWithLogs(5)
@@ -156,11 +176,10 @@ func TestProfiles_TierOrder_ResourceLabelsBeforeProfileAttrs(t *testing.T) {
 func TestProfiles_ForcePruneWhenAllProtected(t *testing.T) {
 	// All remaining attrs are protected; force-prune guarantees the hard limit
 	// is still met and logs an error.
-	pd, resource, scope, dic, prof := newTestProfiles()
+	pd, resource, scope, _, prof := newTestProfiles()
 	resource.PutStr("service.name", "svc")
 	resource.PutStr("k8s.pod.uid", "uid-1")
 	resource.PutStr("cloud.resource_id", "arn:...")
-	_ = dic
 
 	p, logs := newTestProcessorWithLogs(2)
 	_, err := p.processProfiles(t.Context(), pd)
@@ -179,6 +198,7 @@ func TestProfiles_SharedResourceTrimmedOncePerResourceProfiles(t *testing.T) {
 	resource.PutStr("service.name", "svc")
 	resource.PutStr("k8s.node.label.droppable", "v") // tier 6
 	dic := pd.Dictionary()
+	seedProfileDict(dic)
 	sp := rp.ScopeProfiles().AppendEmpty()
 	p1 := sp.Profiles().AppendEmpty()
 	p2 := sp.Profiles().AppendEmpty()
@@ -196,9 +216,101 @@ func TestProfiles_SharedResourceTrimmedOncePerResourceProfiles(t *testing.T) {
 	assert.Equal(t, 1, p2.AttributeIndices().Len(), "leaf.b kept")
 }
 
-// pad renders i as a fixed-width zero-padded string so generated keys are unique
-// and sort stably.
-func pad(i int) string {
-	const digits = "0123456789"
-	return string([]byte{digits[(i/100)%10], digits[(i/10)%10], digits[i%10]})
+// TestProfiles_ScopeAttrsDroppedBeforeProfileAttrs covers the tier-9 (scope)
+// vs tier-10 (profile leaf) ordering: a droppable scope attribute is shed before
+// any profile attribute.
+func TestProfiles_ScopeAttrsDroppedBeforeProfileAttrs(t *testing.T) {
+	pd, resource, scope, dic, prof := newTestProfiles()
+	resource.PutStr("service.name", "svc") // protected
+	scope.PutStr("scope.droppable", "v")   // tier 9, droppable
+	addProfileAttr(dic, prof, "leaf.a")
+	addProfileAttr(dic, prof, "leaf.b")
+	// total = 1 resource + 1 scope + 2 profile = 4; limit 3; excess 1.
+
+	p, _ := newTestProcessorWithLogs(3)
+	_, err := p.processProfiles(t.Context(), pd)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, totalProfileAttrs(resource, scope, prof))
+	_, scopeKept := scope.Get("scope.droppable")
+	assert.False(t, scopeKept, "droppable scope attr should go before profile leaf attrs")
+	assert.Equal(t, 2, prof.AttributeIndices().Len(), "both profile attrs survive")
+}
+
+// TestProfileAttrLeaf_RemoveDropsOneOccurrence covers remove() when a profile
+// references the same key more than once: one call drops exactly one index.
+func TestProfileAttrLeaf_RemoveDropsOneOccurrence(t *testing.T) {
+	_, _, _, dic, prof := newTestProfiles()
+	addProfileAttr(dic, prof, "dup")
+	// reference the same table entry a second time
+	prof.AttributeIndices().Append(prof.AttributeIndices().At(0))
+	require.Equal(t, 2, prof.AttributeIndices().Len())
+
+	leaf := profileAttrLeaf{indices: prof.AttributeIndices(), table: dic.AttributeTable(), strings: dic.StringTable()}
+	leaf.remove("dup")
+	assert.Equal(t, 1, prof.AttributeIndices().Len(), "remove drops exactly one occurrence")
+	leaf.remove("dup")
+	assert.Equal(t, 0, prof.AttributeIndices().Len(), "second remove drops the other occurrence")
+}
+
+// TestProfileAttrLeaf_KeyAtOutOfRange covers the guards in keyAt against indices
+// pointing outside the attribute or string table (malformed input): keyAt
+// returns "" and the processor does not panic.
+func TestProfileAttrLeaf_KeyAtOutOfRange(t *testing.T) {
+	pd, resource, _, dic, prof := newTestProfiles()
+	resource.PutStr("service.name", "svc")
+	// index far beyond the attribute table
+	prof.AttributeIndices().Append(9999)
+
+	leaf := profileAttrLeaf{indices: prof.AttributeIndices(), table: dic.AttributeTable(), strings: dic.StringTable()}
+	assert.Empty(t, leaf.keyAt(9999), "out-of-range table index resolves to empty string")
+
+	p, _ := newTestProcessorWithLogs(150)
+	require.NotPanics(t, func() {
+		_, err := p.processProfiles(t.Context(), pd)
+		require.NoError(t, err)
+	})
+}
+
+// TestProfileSubject_Fallback covers profileSubject when the sample type is
+// absent or unresolvable: it falls back to "profile".
+func TestProfileSubject_Fallback(t *testing.T) {
+	_, _, _, dic, prof := newTestProfiles()
+	// SampleType defaults to type strindex 0 -> "" in our seeded table -> fallback.
+	assert.Equal(t, "profile", profileSubject(prof, dic.StringTable()))
+}
+
+// TestProfiles_CreateAndConsume drives a real profile through the factory's
+// CreateProfiles -> ConsumeProfiles path (the generated lifecycle test only
+// constructs the processor; this one exercises trimming end to end).
+func TestProfiles_CreateAndConsume(t *testing.T) {
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig()
+
+	var captured pprofile.Profiles
+	next, err := xconsumer.NewProfiles(func(_ context.Context, pd pprofile.Profiles) error {
+		captured = pd
+		return nil
+	})
+	require.NoError(t, err)
+
+	proc, err := factory.(xprocessor.Factory).CreateProfiles(t.Context(), processortest.NewNopSettings(typ), cfg, next)
+	require.NoError(t, err)
+	require.NoError(t, proc.Start(t.Context(), componenttest.NewNopHost()))
+
+	pd, resource, _, dic, prof := newTestProfiles()
+	resource.PutStr("service.name", "svc")
+	for i := range 200 {
+		addProfileAttr(dic, prof, "leaf.key"+fmt.Sprintf("%03d", i))
+	}
+	require.NoError(t, proc.ConsumeProfiles(t.Context(), pd))
+	require.NoError(t, proc.Shutdown(t.Context()))
+
+	require.Equal(t, 1, captured.ResourceProfiles().Len())
+	outRP := captured.ResourceProfiles().At(0)
+	outProf := outRP.ScopeProfiles().At(0).Profiles().At(0)
+	assert.Equal(t, 150, outRP.Resource().Attributes().Len()+outProf.AttributeIndices().Len(),
+		"over-cap profile delivered trimmed to the limit through the factory path")
+	_, ok := outRP.Resource().Attributes().Get("service.name")
+	assert.True(t, ok, "service.name preserved")
 }
