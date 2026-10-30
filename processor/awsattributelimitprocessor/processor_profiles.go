@@ -66,12 +66,9 @@ func (l profileAttrLeaf) remove(key string) {
 	})
 }
 
-// processProfiles enforces the attribute limit on every profile, mirroring the
-// metrics path: resource and scope attributes are plain maps reused across the
-// shared tier logic, while each profile's own attributes are the innermost
-// (tier 10, last-resort) dimension. The 150-attribute cap is counted per profile
-// as resource + scope + profile attributes, matching how the CloudWatch backend
-// counts and rejects.
+// processProfiles enforces the attribute limit on every profile, counted as
+// resource + scope + profile attributes (the profile-level cap). Resource and
+// scope are plain maps; the profile's own attributes are the tier-10 leaf.
 func (p *attributeLimitProcessor) processProfiles(_ context.Context, pd pprofile.Profiles) (pprofile.Profiles, error) {
 	dic := pd.Dictionary()
 	table := dic.AttributeTable()
@@ -98,7 +95,7 @@ func (p *attributeLimitProcessor) processProfiles(_ context.Context, pd pprofile
 			for k := 0; k < profs.Len(); k++ {
 				prof := profs.At(k)
 				leaf := profileAttrLeaf{indices: prof.AttributeIndices(), table: table, strings: strs}
-				p.enforceLimit(resourceAttrs, scopeAttrs, leaf, profileSubject(prof, strs))
+				enforceLimit(p, resourceAttrs, scopeAttrs, leaf, "profile", profileSubject(prof, strs))
 			}
 		}
 	}

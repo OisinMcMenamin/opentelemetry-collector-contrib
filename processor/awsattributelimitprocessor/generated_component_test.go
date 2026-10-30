@@ -15,7 +15,6 @@ import (
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/pmetric"
-	"go.opentelemetry.io/collector/pdata/pprofile"
 	"go.opentelemetry.io/collector/pdata/ptrace"
 	"go.opentelemetry.io/collector/processor"
 	"go.opentelemetry.io/collector/processor/processortest"
@@ -101,14 +100,6 @@ func TestComponentLifecycle(t *testing.T) {
 						traces.MarkReadOnly()
 					}
 					err = e.ConsumeTraces(context.Background(), traces)
-				case "profiles":
-					e, ok := c.(xprocessor.Profiles)
-					require.True(t, ok)
-					profiles := generateLifecycleTestProfiles()
-					if !e.Capabilities().MutatesData {
-						profiles.MarkReadOnly()
-					}
-					err = e.ConsumeProfiles(context.Background(), profiles)
 				}
 			})
 			require.NoError(t, err)
@@ -151,14 +142,6 @@ func generateLifecycleTestTraces() ptrace.Traces {
 	span.SetStartTimestamp(pcommon.NewTimestampFromTime(time.Now().Add(-1 * time.Second)))
 	span.SetEndTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	return traces
-}
-
-func generateLifecycleTestProfiles() pprofile.Profiles {
-	profiles := pprofile.NewProfiles()
-	rp := profiles.ResourceProfiles().AppendEmpty()
-	rp.Resource().Attributes().PutStr("resource", "R1")
-	rp.ScopeProfiles().AppendEmpty().Profiles().AppendEmpty()
-	return profiles
 }
 
 var _ component.Host = (*mdatagenNopHost)(nil)

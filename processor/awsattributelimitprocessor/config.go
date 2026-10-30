@@ -9,8 +9,9 @@ import (
 
 // Config defines the configuration for the awsattributelimit processor.
 type Config struct {
-	// MaxTotalAttributes is the maximum combined count of resource attributes,
-	// scope attributes, and datapoint attributes allowed per metric datapoint.
+	// MaxTotalAttributes is the maximum combined count of attributes allowed per
+	// record: resource + scope + datapoint attributes for a metric datapoint, and
+	// resource + scope + profile attributes for a profile.
 	// Defaults to 150, matching the aws backend hard limit.
 	MaxTotalAttributes int `mapstructure:"max_total_attributes"`
 

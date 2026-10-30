@@ -51,11 +51,19 @@ Within the same tier, attributes are dropped alphabetically. Protected attribute
 
 If the count is still over the limit after all tiers are exhausted (only protected attributes remain), the processor force-prunes attributes — including protected ones — sorted alphabetically from the end, until the limit is met. An error is logged when this occurs.
 
+## Profiles
+
+Profiles reuse the same policy and tier table as metrics, with two notes:
+
+- The profile's attributes are dictionary-encoded (references into the shared `ProfilesDictionary` attribute table). The processor trims by removing the over-cap references from the individual profile and **never mutates the shared dictionary tables**, which other profiles, samples, and locations reference.
+- Profile attributes are classified on the same axis as metric datapoint attributes, so the datapoint-protected keys above (`cpu`, `mode`, `device`, `neuroncore`, ...) also protect a profile attribute that happens to share one of those names. This is harmless in practice.
+- A `Sample` within a profile has its own, separate ≤150 attribute cap. This processor enforces the **profile-level** cap only (resource + scope + profile attributes); sample-level attributes are out of scope.
+
 ## Configuration
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `max_total_attributes` | Maximum combined count of resource, scope, and datapoint attributes per metric datapoint. Must be between 1 and 150 (inclusive). | `150` |
+| `max_total_attributes` | Maximum combined count of attributes per record: resource + scope + datapoint attributes for a metric datapoint, or resource + scope + profile attributes for a profile. Must be between 1 and 150 (inclusive). | `150` |
 | `unconditional_removal_prefixes` | List of resource attribute key prefixes to always remove. | `[]` |
 | `unconditional_removal_keys` | List of exact resource attribute keys to always remove. | `[]` |
 
