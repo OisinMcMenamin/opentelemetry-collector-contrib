@@ -256,22 +256,28 @@ func enforceLimit[L leafAttributes](p *attributeLimitProcessor, resourceAttrs, s
 }
 
 // forcePrune is a last-resort safety net that should never activate in practice.
-// By the time forcePrune is called, all tier-based dropping has been exhausted,
-// meaning every remaining attribute is protected. This function exists only to
-// guarantee the 150-attribute hard limit is never exceeded -- if it runs, it means
-// the metric has 150+ protected attributes, which indicates a misconfiguration
-// (too many attributes marked as protected) rather than normal operation.
+// It runs only after all tier-based dropping is exhausted, i.e. only
+// tier-undroppable attributes remain, and guarantees the hard limit is never
+// exceeded.
 //
-// The drop order here is intentionally the opposite of tier-based dropping.
-// In tier-based dropping, resource labels are dropped first because they are
-// low-value metadata that customers rarely query by. But in forcePrune, every
-// remaining attribute is protected and important -- so we minimize blast radius
-// by dropping leaf attrs first (per-record, no shared impact), then
-// scope, then resource last (shared across all records under the resource).
+// It drops in two passes. Pass 1 drops NON-identity attributes in blast-radius
+// order (leaf first, then scope, then resource), keeping identity: service.name,
+// service.instance.id, k8s pod identity (k8s.pod.name/namespace.name/uid),
+// cloud.resource_id, and the agent's cloudwatch.* scope stamps. This matters for
+// a resource-heavy producer whose attributes are all tier-undroppable: without
+// it, resource attributes are removed alphabetically from the end and
+// service.name (which sorts late) is dropped first, so the backend rejects the
+// record for a missing service.name -- the very outcome the processor exists to
+// prevent. Pass 2 is the true last resort: if the record carries more identity
+// attributes than the limit (a misconfiguration), it drops identity too,
+// alphabetically from the end, to still guarantee the limit.
 //
-// Within each dimension, keys are sorted alphabetically and removed from the end.
-// Returns the number of attributes force-pruned. Generic over the concrete leaf
-// type for the same no-boxing reason as enforceLimit.
+// This applies to both metrics and profiles (shared code). It changes only which
+// attributes survive the last-resort path, never the resulting count, and
+// force-prune is a should-never-fire safety net, so the metrics change is inert
+// in normal operation and strictly protects identity when it does fire.
+//
+// Generic over the concrete leaf type for the same no-boxing reason as enforceLimit.
 func forcePrune[L leafAttributes](p *attributeLimitProcessor, resourceAttrs, scopeAttrs pcommon.Map, leaf L) int {
 	excess := resourceAttrs.Len() + scopeAttrs.Len() + leaf.Len() - p.config.MaxTotalAttributes
 	if excess <= 0 {
@@ -280,17 +286,22 @@ func forcePrune[L leafAttributes](p *attributeLimitProcessor, resourceAttrs, sco
 
 	pruned := 0
 
-	// Prune leaf attributes first (per-record, least shared impact).
+	// Pass 1: drop non-identity, leaf -> scope -> resource. Leaf carries no
+	// identity, so it is dropped freely and first.
 	pruned += pruneFromLeaf(leaf, excess-pruned)
-
-	// Then scope attributes.
 	if pruned < excess {
-		pruned += pruneFromMap(scopeAttrs, excess-pruned)
+		pruned += pruneFromMap(scopeAttrs, excess-pruned, isForcePruneProtectedScope)
+	}
+	if pruned < excess {
+		pruned += pruneFromMap(resourceAttrs, excess-pruned, isForcePruneProtectedResource)
 	}
 
-	// Then resource attributes last (most shared impact).
+	// Pass 2 (last resort): more identity than the limit; drop it too.
 	if pruned < excess {
-		pruned += pruneFromMap(resourceAttrs, excess-pruned)
+		pruned += pruneFromMap(scopeAttrs, excess-pruned, nil)
+	}
+	if pruned < excess {
+		pruned += pruneFromMap(resourceAttrs, excess-pruned, nil)
 	}
 
 	return pruned
@@ -320,8 +331,9 @@ func pruneFromLeaf[L leafAttributes](leaf L, count int) int {
 }
 
 // pruneFromMap removes up to `count` attributes from the map, sorted alphabetically
-// (removes last keys first). Returns the number actually removed.
-func pruneFromMap(attrs pcommon.Map, count int) int {
+// (removes last keys first). When keep is non-nil, keys for which keep returns
+// true are skipped (not removed). Returns the number actually removed.
+func pruneFromMap(attrs pcommon.Map, count int, keep func(string) bool) int {
 	if count <= 0 || attrs.Len() == 0 {
 		return 0
 	}
@@ -333,9 +345,12 @@ func pruneFromMap(attrs pcommon.Map, count int) int {
 	})
 	slices.Sort(keys)
 
-	// Remove from the end (alphabetically last).
+	// Remove from the end (alphabetically last), skipping kept keys.
 	removed := 0
 	for i := len(keys) - 1; i >= 0 && removed < count; i-- {
+		if keep != nil && keep(keys[i]) {
+			continue
+		}
 		attrs.Remove(keys[i])
 		removed++
 	}
