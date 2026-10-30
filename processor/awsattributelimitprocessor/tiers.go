@@ -92,6 +92,36 @@ var protectedPrefixes = []string{
 // protectedScopePrefix is the scope attribute prefix that is never dropped.
 const protectedScopePrefix = "cloudwatch."
 
+// forcePruneIdentityKeys are resource attributes that force-prune must preserve
+// unless nothing else remains to drop. Force-prune runs only after the tier
+// phase is exhausted (every remaining attribute is tier-undroppable), so a
+// resource-heavy producer whose attributes are all tier-undroppable would
+// otherwise lose its identity -- e.g. service.name -- and be rejected by the
+// backend ("service.name is required"). service.name and service.instance.id
+// are not in any tier protected set; they survive the tier phase only because
+// non-label resource attributes are never tier-classified.
+var forcePruneIdentityKeys = map[string]struct{}{
+	"service.name":        {},
+	"service.instance.id": {},
+	"k8s.pod.name":        {},
+	"k8s.namespace.name":  {},
+	"k8s.pod.uid":         {},
+	"cloud.resource_id":   {},
+}
+
+// isForcePruneProtectedResource reports whether a resource attribute is identity
+// that force-prune keeps unless it is the last thing left to drop.
+func isForcePruneProtectedResource(key string) bool {
+	_, ok := forcePruneIdentityKeys[key]
+	return ok
+}
+
+// isForcePruneProtectedScope reports whether a scope attribute is an agent-stamped
+// cloudwatch.* identity that force-prune keeps unless it is the last thing left.
+func isForcePruneProtectedScope(key string) bool {
+	return strings.HasPrefix(key, protectedScopePrefix)
+}
+
 // isProtectedResource returns true if the key is a protected resource attribute.
 func isProtectedResource(key string) bool {
 	if _, ok := protectedResourceKeys[key]; ok {
